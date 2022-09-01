@@ -1,0 +1,184 @@
+---
+title: "24 samples LIFE Data - Tree status"
+author: "Sergio Diez Hermano"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  html_document:
+      highlight: tango
+      code_folding: show
+      toc: yes
+      toc_depth: 4
+      toc_float:
+        collapsed: yes
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+# include this code chunk as-is to set options
+opts_chunk$set(comment = NA, prompt = FALSE, fig.height = 5, fig.width = 5, dpi = 300, fig.align = "center", 
+               message = FALSE, warning = FALSE, cache = FALSE, verbose = FALSE)
+# Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/Pandoc")
+Sys.setlocale("LC_TIME", "C")
+```
+
+# Libraries and functions
+
+```{r}
+suppressMessages(library("dplyr"))
+suppressMessages(library("ggplot2"))
+suppressMessages(library("PerformanceAnalytics"))
+
+# Función para agregar coeficientes de correlación
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  # Cor <- abs(cor(x, y)) # Elimina la función abs si lo prefieres
+  Cor <- cor(x, y) # Elimina la función abs si lo prefieres
+  txt <- paste0(prefix, format(c(Cor, 0.123456789), digits = digits)[1])
+  if(missing(cex.cor)) {
+    cex.cor <- 0.4 / strwidth(txt)
+  }
+  text(0.5, 0.5, txt,
+       cex = 1.2 + cex.cor * Cor) # Escala el texto al nivel de correlación
+  # Estimate and plot significance
+  pval <- cor.test(x, y)$p.value
+  if (pval > 0.01 & pval <= 0.05) {
+    txt2 <- "*"
+  } else if (pval > 0.001 & pval <= 0.01) {
+    txt2 <- "**"
+  } else if (pval < 0.001) {
+    txt2 <- "***"
+  } else {
+    txt2 <- NA
+  }
+  if (!is.na(txt2)) {
+    text(0.8, 0.8, txt2,
+         cex = 1,
+         col = "red") # Escala el texto al nivel de correlación
+  }
+  
+}
+```
+
+# Load data
+
+```{r}
+treestat <- read.csv("../curated_data/tree_status.csv", sep=";", stringsAsFactors = T)
+str(treestat)
+```
+
+# Correlation plots
+
+https://r-coder.com/grafico-correlacion-r/
+
+```{r}
+
+par(cex = 1.2)
+
+for (i in unique(treestat$Tree.species)) {
+  
+  data <- treestat[treestat$Tree.species == i, c("Diameter", "Height", "Crown.Mortality", "Crown.Defoliation")] %>%
+    na.omit()
+  grupos <- treestat[treestat$Tree.species == i, "Stand"]
+  
+  pairs(data,                                 # Data frame de variables
+        labels = colnames(data),              # Nombres de las variables
+        pch = 21,                             # Símbolo pch
+        bg = c("orange", "skyblue")[grupos],  # Color de fondo del símbolo (pch 21 a 25)
+        # col = c("orange", "skyblue")[grupos], # Color de borde del símbolo
+        main = i,                             # Título del gráfico
+        gap = 1,                              # Distancia entre subplots
+        font.labels = 1,
+        upper.panel = panel.cor)
+  
+  
+}
+
+```
+
+```{r}
+
+for (i in unique(treestat$Tree.species)) {
+  
+  data <- treestat[treestat$Tree.species == i, c("Diameter", "Height", "Crown.Mortality", "Crown.Defoliation")]
+  grupos <- treestat[treestat$Tree.species == i, "Stand"]
+  
+  chart.Correlation(data, 
+                    histogram = TRUE, 
+                    method = "pearson",
+                    pch = 21,                         
+                    col = c("orange", "skyblue")[grupos],
+                    main = i)
+  
+  
+}
+
+```
+
+
+# Boxplots diameter, height, crown
+
+```{r, fig.height=10, fig.width=12}
+png(filename="tree_status.png", type="cairo",
+      units="in", width=12, height=10, pointsize=12,
+      res=300)
+
+# par(mfrow = c(2,2), cex = 1.2, mar = c(3.1, 4.1, 4.1, 2.1))
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,5), nrow = 3, ncol = 2, byrow = TRUE), heights = c(5, 5, 0.5), widths = c(6, 6))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 1, 0.5, 0.3))
+
+boxplot(Diameter ~ Stand + Tree.species, data = treestat, 
+        col = c("orange", "skyblue"), xaxt = "n",
+        at = c(1.05, 1.95, 3.05, 3.95, 5.05, 5.95, 7.05, 7.95),
+        ylab = "Diameter (cm)",
+        xlab = NA,
+        main = "Diameter")
+axis(1, at = c(1.5, 3.5, 5.5, 7.5), labels = unique(treestat$Tree.species))
+
+boxplot(Height ~ Stand + Tree.species, data = treestat, 
+        col = c("orange", "skyblue"), xaxt = "n",
+        at = c(1.05, 1.95, 3.05, 3.95, 5.05, 5.95, 7.05, 7.95),
+        ylab = "Height (m)",
+        xlab = NA,
+        main = "Height")
+axis(1, at = c(1.5, 3.5, 5.5, 7.5), labels = unique(treestat$Tree.species))
+
+boxplot(Crown.Mortality ~ Stand + Tree.species, data = treestat, 
+        col = c("orange", "skyblue"), xaxt = "n",
+        at = c(1.05, 1.95, 3.05, 3.95, 5.05, 5.95, 7.05, 7.95),
+        ylab = "Percentage",
+        xlab = "Tree species",
+        main = "Crown Mortality")
+axis(1, at = c(1.5, 3.5, 5.5, 7.5), labels = unique(treestat$Tree.species))
+
+boxplot(Crown.Defoliation ~ Stand + Tree.species, data = treestat, 
+        col = c("orange", "skyblue"), xaxt = "n",
+        at = c(1.05, 1.95, 3.05, 3.95, 5.05, 5.95, 7.05, 7.95),
+        ylab = "Percentage",
+        xlab = "Tree species",
+        main = "Crown Defoliation")
+axis(1, at = c(1.5, 3.5, 5.5, 7.5), labels = unique(treestat$Tree.species))
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+```
+
+# Estimate means
+
+```{r}
+crownmort.mean <- aggregate(Crown.Mortality ~ Tree.species + Stand, data = treestat, mean)
+crownmort.sd <- aggregate(Crown.Mortality ~ Tree.species + Stand, data = treestat, sd)
+```
+
+

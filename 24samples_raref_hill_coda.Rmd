@@ -1,0 +1,1958 @@
+---
+title: "24 samples LIFE Data - Compositional Data"
+author: "Sergio Diez Hermano"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  html_document:
+      highlight: tango
+      code_folding: show
+      toc: yes
+      toc_depth: 4
+      toc_float:
+        collapsed: yes
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+# include this code chunk as-is to set options
+opts_chunk$set(comment = NA, prompt = FALSE, fig.height = 5, fig.width = 5, dpi = 300, fig.align = "center", 
+               message = FALSE, warning = FALSE, cache = FALSE, verbose = FALSE)
+# Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/Pandoc")
+Sys.setlocale("LC_TIME", "C")
+```
+
+# Libraries and functions
+
+```{r}
+suppressMessages(library("tidyr"))      # reshape to long format
+suppressMessages(library("pbapply"))
+suppressMessages(library("doParallel")) # parallel computing
+suppressMessages(library("parallel"))   # parallel computing
+suppressMessages(library("dplyr"))      # aggregate counts by taxa
+suppressMessages(library("tidyverse"))  # column to row names
+suppressMessages(library("openxlsx"))   # create a new Workbook object
+suppressMessages(library("xlsx"))       # create a new Workbook object
+suppressMessages(library("ggplot2"))
+suppressMessages(library("plotrix"))       # draw.circles
+suppressMessages(library("ggVennDiagram")) # show in R and fills with color gradient
+suppressMessages(library("VennDiagram"))   # don't show directly in R and changes circle size with shared data
+suppressMessages(library("ggplotify"))     # grid2grob
+suppressMessages(library("ggpubr"))        # ggarrange
+
+#######################
+# Hill diversity
+suppressMessages(library("MeanRarity"))
+
+#######################
+# CODA analysis
+suppressMessages(library("ALDEx2"))
+suppressMessages(library("CoDaSeq"))
+suppressMessages(library("zCompositions"))
+suppressMessages(library("igraph"))
+suppressMessages(library("grDevices"))
+suppressMessages(library("vegan"))
+suppressMessages(library("propr"))     # Rho
+suppressMessages(library("reshape2"))  # dendrogram in Rho
+
+######################
+# Phylogeny trees
+suppressMessages(library("metacoder"))
+
+######################################################################
+# Function to find minimum reads to convert relative to raw abundances
+
+getMin <- function(column, candidates, tol) {
+  # Each candidate times vector of relative abundances
+  cand.rel <- sapply(candidates, function(x) column*x)
+  # Check if generated numbers are integers to a certain tolerance value
+  cand.int <- apply(cand.rel, 2, 
+                    function(x) sapply(x, 
+                                       function(i) min(abs(c(i%%1, i%%1-1))) < 1e-1))
+  # Get first candidate that generate an all integers vector
+  cand.check <- candidates[which(colSums(cand.int) == length(column))[1]]
+  
+}
+
+####################################################
+# Function to extract taxa ranks from taxonomy list
+taxaGet <- function(taxaname, taxranks) {
+  taxavec <- character()
+  for (i in taxranks) {
+    if (i %in% taxaname$rank) {
+      taxavec[i] <- taxaname[taxaname$rank == i, 1]
+    } else {
+      taxavec[i] <- NA
+    }
+  }
+  return(taxavec)
+}
+
+########################################
+# Function to get color labels for dendrogram
+colLab <- function(n) {
+  if (is.leaf(n)) {
+    a <- attributes(n)
+    #labCol <- labelColors[clusMember[which(names(clusMember) == a$label)]]
+    labCol <- if (grepl("D", a$label) == TRUE ) "orange" else "skyblue"
+    attr(n, "nodePar") <- c(a$nodePar, lab.col = labCol)
+  }
+  n
+}
+
+########################################
+# Estimate intersection between two circles
+circle_intersection <- function(x1, y1, r1, x2, y2, r2){
+  rr1 <- r1 * r1
+  rr2 <- r2 * r2
+  d <- sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
+  
+  if (d > r2 + r1) # Circles do not overlap
+  {
+    return(0)
+  } else if (d <= abs(r1 - r2) && r1 >= r2){ # Circle2 is completely inside circle1  
+    return(pi*rr2)
+  } else if (d <= abs(r1 - r2) && r1 < r2){ # Circle1 is completely inside circle2
+    return(pi*rr1)
+  } else { # Circles partially overlap
+    phi <- (acos((rr1 + (d * d) - rr2) / (2 * r1 * d))) * 2
+    theta <- (acos((rr2 + (d * d) - rr1) / (2 * r2 * d))) * 2
+    area2 <- 0.5 * theta * rr2 - 0.5 * rr2 * sin(theta)
+    area1 <- 0.5 * phi * rr1 - 0.5 * rr1 * sin(phi)
+    return(area1 + area2)
+  }
+}
+```
+
+# Load data
+
+```{r}
+# Load csv file
+data24 <- read.csv("../curated_data/24 SAMPLES_2021-05-24_taxa_abundances_fungi_bpo273_order1469.csv", sep = ";")
+data24$PARCELA <- c(rep("Holm oak", 6), rep("Pyrenean oak", 6), rep("Chestnut", 6), rep("Cork oak", 6))
+data24 <- data24[order(data24$PARCELA), ]
+
+# Separate abundances from metadata
+# Discard column 5 as it's meaningless (originally this column indicated samples with doubtful origin)
+data24.meta <- data24[, 1:4]
+data24.abun <- as.data.frame(t(data24[, 6:dim(data24)[2]]))
+colnames(data24.abun) <- data24.meta$UVA
+
+# Check that all samples' abundance sums up to 100
+colSums(data24.abun)
+
+# Load taxonomy
+taxlist <- readRDS("24samples_ncbi_taxonomy.RDS")
+names(taxlist) <- stringr::str_replace_all(names(taxlist), "\\ sp$", " sp.")
+
+# select taxonomic ranks of interest
+taxcats <- c("kingdom", "phylum", "class", "order", "family", "genus", "species")
+taxlist.get <- lapply(taxlist, function(x) taxaGet(x, taxcats))
+data24.taxa <- as.data.frame(do.call(rbind, taxlist.get))
+colnames(data24.taxa) <- taxcats
+
+```
+
+# Raw counts
+
+Generate raw data from relative abundances. RUN ONLY FIRST TIME AND SAVE THE OUTPUT, THEN LOAD csv
+
+```{r}
+# # To recover the original integer numbers from percentage numbers:
+# 
+# # 1- divide percentage vector by its minimun
+# min.relabun <- apply(data24.abun, 2, function(x) min(x[x>0]))
+# data24.min <- as.data.frame(sapply(1:ncol(data24.abun), function(x) data24.abun[,x]/min.relabun[x]))
+# 
+# # 2- find the smallest integer that recovers a full integer vector
+# ## List of potential numbers
+# candidates <- 1:500
+# ## Parallelize multiple cores
+# no_cores <- detectCores(logical = TRUE); cl <- makeCluster(no_cores-1); registerDoParallel(cl)
+# ## Actual calculation
+# smallest.int <- pbapply(data24.min, 2, function(x) getMin(x, candidates, 1e-1))
+# 
+# # 3- multiply by the estimated vector
+# data24.raw <- round(as.data.frame(sapply(1:ncol(data24.abun), function(x) data24.min[,x]*smallest.int[x])))
+# colnames(data24.raw) <- colnames(data24.abun)
+# rownames(data24.raw) <- rownames(data24.abun)
+# colSums(data24.raw)
+# 
+# # Save
+# write.csv(data24.raw, "data24raw.csv")
+
+# Load
+data24.raw <- read.csv("data24raw.csv")
+row.names(data24.raw) <- data24.raw$X
+data24.raw[1] <- NULL
+
+# Check total reads per sample
+colSums(data24.raw)
+
+# Check number of otus per taxonomic level
+apply(data24.taxa[!is.na(data24.taxa$kingdom), ], 2, function(x) length(unique(x)))
+sort(table(data24.taxa[!is.na(data24.taxa$kingdom), "phylum"]), decreasing = T)
+sort(table(data24.taxa[!is.na(data24.taxa$kingdom), "phylum"])/sum(table(data24.taxa[!is.na(data24.taxa$kingdom), "phylum"])),
+     decreasing = T)
+```
+
+# Set taxonomic resolution
+
+```{r}
+# Select taxonomic level (lowercase)
+taxalev <- "genus"
+
+if (taxalev != "species") {
+  
+  datadup <- data24.raw
+  datadup$taxa <- data24.taxa[, taxalev]
+  data24.res <- datadup %>% group_by(taxa) %>% summarise(across(everything(), sum)) %>% as.data.frame()
+  data24.res[is.na(data24.res$taxa), "taxa"] <- "undefined"
+  rownames(data24.res) <- data24.res$taxa
+  data24.res <- subset(data24.res, select = -taxa)
+  rm(datadup)
+  
+}
+
+# Folder for results
+folder <- paste("coda_results/", taxalev,"/", sep="")
+if (!dir.exists(folder)) {dir.create(folder)}
+```
+
+# Plot tree
+
+https://grunwaldlab.github.io/metacoder_documentation/faq.html#the-labels-are-too-small
+
+## Calculations
+
+```{r}
+taxonlist <- list()
+
+for (i in taxcats) {
+  
+  taxonlist[[i]] <- sapply(data24.taxa[, i], function(x) paste(substr(i, 1, 1), "__", x, sep=""))
+  
+}
+
+taxonframe <- do.call(cbind, taxonlist) %>% as.data.frame(., row.names = rownames(data24.taxa))
+data24.taxmap <- data24.raw
+data24.taxmap$taxonomy <- apply(taxonframe, 1, function(x) paste("Root", paste(x, collapse=";"), sep=";"))
+data24.taxmap <- cbind(data24.taxmap, data24.taxa)
+
+# Global obj
+obj <- parse_tax_data(data24.taxmap,
+                      class_cols = "taxonomy",
+                      class_sep = ";",
+                      class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+                      class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+names(obj$data) <- "otu_counts"
+obj <- filter_taxa(obj, taxon_names != "")
+obj <- filter_taxa(obj, taxon_names == "Fungi", subtaxa = TRUE)
+
+# Declined obj
+dis.taxmap <- data24.taxmap[, c(grep("D", colnames(data24.taxmap)), 25:32)]
+dis.taxmap <- dis.taxmap[which(rowSums(dis.taxmap[1:12]) > 0), ] 
+dis.obj <- parse_tax_data(dis.taxmap,
+                      class_cols = "taxonomy",
+                      class_sep = ";",
+                      class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+                      class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+names(dis.obj$data) <- "otu_counts"
+dis.obj <- filter_taxa(dis.obj, taxon_names != "")
+dis.obj <- filter_taxa(dis.obj, taxon_names == "Fungi", subtaxa = TRUE)
+
+# Healthy obj
+hel.taxmap <- data24.taxmap[, c(grep("H", colnames(data24.taxmap)), 25:32)]
+hel.taxmap <- hel.taxmap[which(rowSums(hel.taxmap[1:12]) > 0), ] 
+hel.obj <- parse_tax_data(hel.taxmap,
+                      class_cols = "taxonomy",
+                      class_sep = ";",
+                      class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+                      class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+names(hel.obj$data) <- "otu_counts"
+hel.obj <- filter_taxa(hel.obj, taxon_names != "")
+hel.obj <- filter_taxa(hel.obj, taxon_names == "Fungi", subtaxa = TRUE)
+
+# By tree species obj
+spec.objs <- list()
+
+for (i in seq(1,24,6)) {
+  
+  tree.taxmap <- data24.taxmap[, c(i:(i+5), 25:32)]
+  tree.taxmap <- tree.taxmap[which(rowSums(tree.taxmap[1:6]) > 0), ] 
+  tree.obj <- parse_tax_data(tree.taxmap,
+                            class_cols = "taxonomy",
+                            class_sep = ";",
+                            class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+                            class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+  names(tree.obj$data) <- "otu_counts"
+  tree.obj <- filter_taxa(tree.obj, taxon_names != "")
+  tree.obj <- filter_taxa(tree.obj, taxon_names == "Fungi", subtaxa = TRUE)
+  spec.objs[[data24.meta[i,"PARCELA"]]] <- tree.obj
+  
+}
+
+# # Add a new data object to plot "Declined" and "Healthy" tree
+# datacounts <- obj$data$otu_counts
+# discounts <- rowSums(datacounts[, grep("D", colnames(datacounts))])
+# helcounts <- rowSums(datacounts[, grep("H", colnames(datacounts))])
+# obj$data$condition_counts <- tibble(taxon_id = rep(datacounts$taxon_id, 2), 
+#                                     treatment_1 = c(rep("Declined", dim(datacounts)[1]), 
+#                                                   rep("Healthy", dim(datacounts)[1])),
+#                                     counts = c(discounts, helcounts))
+```
+
+## Single tree
+
+```{r}
+set.seed(2) # Each number will produce a slightly different result for some layouts
+
+png(filename=paste(folder, "figs/phylum_trees_genusbased.png", sep=""), type="cairo",
+      units="in", width=10, height=7, pointsize=12,
+      res=300)
+
+obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_subtaxa,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            # node_color_interval = c(0, 3),
+            # node_color_interval = c(0, 3),
+            node_size_interval = c(0, 500),
+            node_label_size_range = c(0.015, 0.04),
+            node_color_digits = 0,
+            node_size_digits = 0,
+            # layout = "davidson-harel", initial_layout = "reingold-tilford",
+            tree_label = NA,
+            node_size_axis_label = "Size: No. OTUs",
+            node_color_axis_label = "Color: No. Subtaxa") +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.17), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.335), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F)
+dev.off()
+```
+
+## Save tree per phylum
+
+```{r}
+set.seed(1) # Each number will produce a slightly different result for some layouts
+
+# png(filename=paste(folder, "figs/phylum_trees.png", sep=""), type="cairo",
+#       units="in", width=15, height=15, pointsize=12,
+#       res=300)
+
+obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  filter_taxa(taxon_names %in% c("Ascomycota", "Basidiomycota", "Mucoromycota"),
+              subtaxa = TRUE) %>% 
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_obs,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            node_color_interval = c(0, 650),
+            node_size_interval = c(0, 650),
+            node_color_digits = 0,
+            tree_label = taxon_names,
+            node_color_axis_label = "No. of OTUs",
+            layout = "davidson-harel", initial_layout = "reingold-tilford")
+
+# dev.off()
+```
+
+## Save tree per condition
+
+```{r, fig.width=15, fig.height=10}
+set.seed(2) # Each number will produce a slightly different result for some layouts
+
+png(filename=paste(folder, "figs/phylum_trees_per_condition.png", sep=""), type="cairo",
+      units="in", width=18, height=10, pointsize=12,
+      res=300)
+
+plotlist.cond <- list()
+
+plotlist.cond[["Declined"]] <- dis.obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_obs,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            # node_color_interval = c(0, 3),
+            node_color_interval = c(0, 700),
+            node_size_interval = c(0, 700),
+            node_label_size_range = c(0.012, 0.03),
+            node_color_digits = 0,
+            node_color_axis_label = "No. of OTUs",
+            # layout = "davidson-harel", initial_layout = "reingold-tilford",
+            title = "Declined",
+            tree_label = NA)
+
+plotlist.cond[["Healthy"]] <- hel.obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_obs,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            # node_color_interval = c(0, 3),
+            node_color_interval = c(0, 700),
+            node_size_interval = c(0, 700),
+            node_label_size_range = c(0.012, 0.03),
+            node_color_digits = 0,
+            node_color_axis_label = "No. of OTUs",
+            # layout = "davidson-harel", initial_layout = "reingold-tilford",
+            title = "Healthy",
+            tree_label = NA)
+
+
+# gridExtra::grid.arrange(grobs = plotlist, nrow = 1)
+ggpubr::ggarrange(plotlist = plotlist.cond, nrow = 1, ncol = 2, common.legend = T)
+
+dev.off()
+```
+
+## Save tree per condition and tree
+
+```{r, fig.width=15, fig.height=10}
+set.seed(2) # Each number will produce a slightly different result for some layouts
+
+png(filename=paste(folder, "figs/phylum_trees_per_condition.png", sep=""), type="cairo",
+      units="in", width=15, height=24, pointsize=12,
+      res=300)
+
+plotlist <- list()
+
+plotlist[["Declined"]] <- dis.obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_subtaxa,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            # node_color_interval = c(0, 3),
+            # node_color_interval = c(0, 3),
+            node_size_interval = c(0, 600),
+            node_label_size_range = c(0.015, 0.04),
+            node_color_digits = 0,
+            node_size_digits = 0,
+            # layout = "davidson-harel", initial_layout = "reingold-tilford",
+            title = "Declined",
+            tree_label = NA,
+            node_size_axis_label = "Size: No. OTUs",
+            node_color_axis_label = "Color: No. Subtaxa") +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.17), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.335), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F)
+
+plotlist[["Healthy"]] <- hel.obj %>% 
+  filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+  filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+  heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+            node_size = n_obs,
+            node_color = n_subtaxa,
+            node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                 "#2A788EFF", "#414487FF"),
+            # node_color_interval = c(0, 3),
+            # node_color_interval = c(0, 3),
+            node_size_interval = c(0, 600),
+            node_label_size_range = c(0.015, 0.04),
+            node_color_digits = 0,
+            node_size_digits = 0,
+            # layout = "davidson-harel", initial_layout = "reingold-tilford",
+            title = "Healthy",
+            tree_label = NA,
+            node_size_axis_label = "Size: No. OTUs",
+            node_color_axis_label = "Color: No. Subtaxa") +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.17), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.335), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F)
+
+for (i in names(spec.objs)) {
+  
+  plotlist[[i]] <- spec.objs[[i]] %>% 
+    filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+    filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+    heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+              node_size = n_obs,
+              node_color = n_subtaxa,
+              node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                   "#2A788EFF", "#414487FF"),
+              # node_color_interval = c(0, 3),
+              # node_color_interval = c(0, 3),
+              node_size_interval = c(0, 600),
+              node_label_size_range = c(0.015, 0.04),
+              node_color_digits = 0,
+              node_size_digits = 0,
+              # layout = "davidson-harel", initial_layout = "reingold-tilford",
+              title = i,
+              tree_label = NA,
+              node_size_axis_label = "Size: No. OTUs",
+              node_color_axis_label = "Color: No. Subtaxa") +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.17), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F) +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.335), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F) +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F)
+  
+}
+
+# gridExtra::grid.arrange(grobs = plotlist, nrow = 1)
+ggpubr::ggarrange(plotlist = plotlist, nrow = 3, ncol = 2, common.legend = T)
+
+dev.off()
+```
+
+# Rarefaction curves
+
+```{r, fig.width=15, fig.height=5}
+# goodcov <- QsRutils::goods(t(data24.res))
+raredata <- data24.res
+
+## Parallelize multiple cores
+no_cores <- detectCores(logical = TRUE); cl <- makeCluster(no_cores-1); registerDoParallel(cl)
+
+par(mfrow=c(1,4), cex = 1.2)
+
+rarelist <- list()
+for (i in unique(data24.meta$PARCELA)) {
+  
+  colselec <- data24.meta[data24.meta$PARCELA == i, "UVA"]
+  rarelist[[i]] <- rarecurve(t(raredata[ , colselec]), step = 10, col = c(rep("orange", 3), rep("skyblue", 3)), 
+                             lwd = 1.5,  main = i)
+
+  
+}
+
+```
+
+## Save plots
+
+```{r, fig.width=15, fig.height=5.5}
+
+png(filename=paste(folder, "figs/rarefaction_curves.png", sep=""), type="cairo",
+      units="in", width=15, height=5.5, pointsize=12,
+      res=300)
+
+# Set layout for 5 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+# Common y-axis upper limit
+upY <- sapply(rarelist, 
+              function(x) sapply(x, function(y) y[length(y)])) %>% max()
+
+# Plot
+for (i in unique(data24.meta$PARCELA)) {
+  
+  # Get upper axis limits
+  upX <- sapply(rarelist[[i]], function(x) names(x[length(x)])) %>% 
+    gsub(pattern = "N", replacement = "") %>%
+    as.numeric() %>%
+    max()
+  # upY <- sapply(rarelist[[i]], function(x) x[length(x)]) %>%
+  #   max()
+  
+  if (i == "Chestnut") {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = seq(0,upY,50))
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= 3) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = FALSE)
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= 3) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  }
+ 
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
+
+## Common x axis
+
+```{r, fig.width=16, fig.height=5.5}
+
+png(filename=paste(folder, "figs/rarefaction_curves_commonX.png", sep=""), type="cairo",
+      units="in", width=16, height=5.5, pointsize=12,
+      res=300)
+
+# Set layout for 5 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+# Common x and y-axis upper limit
+upY <- sapply(rarelist, 
+              function(x) sapply(x, function(y) y[length(y)])) %>% max()
+
+upX <- sapply(rarelist, 
+              function(y) sapply(y, function(x) names(x[length(x)]))) %>% 
+  gsub(pattern = "N", replacement = "") %>%
+  as.numeric() %>%
+  max()
+
+# Plot
+for (i in unique(data24.meta$PARCELA)) {
+  
+  # Get upper axis limits
+  # upX <- sapply(rarelist[[i]], function(x) names(x[length(x)])) %>% 
+  #   gsub(pattern = "N", replacement = "") %>%
+  #   as.numeric() %>%
+  #   max()
+  # upY <- sapply(rarelist[[i]], function(x) x[length(x)]) %>%
+  #   max()
+  
+  if (i == "Chestnut") {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = seq(0,upY,50))
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= 3) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = FALSE)
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= 3) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  }
+ 
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
+
+# Hill diversity
+
+Source code and explanations: https://mikeroswell.github.io/MeanRarity/articles/Using_MeanRarity.html
+
+- effective number of rare species, S (l= 1, q=0, species richness), 
+- effective number of common species, eH' (l = 0, q=1, Shannon diversity or exponential or Shannon entropy), 
+- effective number of highly abundant species, 1/D (l = -1, q=2, Simpson diversity or the inverse of Simpson concentration)
+  
+```{r}
+
+# Vector for "l" exponent values
+hillexps <- seq(-1, 1, 0.01)
+
+# Estimate Hill diversity per sample and for every "l" value
+hillframe <- as.data.frame(t(apply(data24.res, 2, function(x) sapply(hillexps, function(y) rarity(x, y)))))
+
+# Add "l" values as column names
+colnames(hillframe) <- hillexps
+
+# Add variables data (sampling site, health status)
+hillframe.var <- cbind(data24.meta, hillframe)
+
+# Long format to ease plotting
+hillframe.long <- hillframe.var %>% gather(Hill, value, -(1:4))
+hillframe.long$Hill <- as.numeric(hillframe.long$Hill)
+hillframe.long$UVA <- as.factor(hillframe.long$UVA)
+hillframe.long$PARCELA <- as.factor(hillframe.long$PARCELA)
+hillframe.long$CONDICION <- as.factor(hillframe.long$CONDICION)
+
+```
+
+## Save plot lines
+
+```{r, fig.width=15, fig.height=6}
+
+png(filename=paste(folder, "figs/hill_diversity_lines.png", sep=""), type="cairo",
+      units="in", width=15, height=6.5, pointsize=12,
+      res=300)
+
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 1), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+
+# Plot
+for (i in unique(hillframe.long$PARCELA)) {
+  
+  if (i == "Chestnut") {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)),
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0,250,50), labels = seq(0,250,50))
+    title(xlab = "Hill diversity", line=2.5)
+
+    # Background grid
+    grid()
+    # Subset sampling site
+    parcelaplot <- hillframe.long[hillframe.long$PARCELA == i, ]
+    
+    for (j in unique(hillframe.long$UVA)) {
+      
+      # Subset replicate
+      uvaplot <- parcelaplot[parcelaplot$UVA == j, ]
+      
+      for (k in unique(hillframe.long$CONDICION)) {
+        
+        # Subset status and plot
+        condiplot <- uvaplot[uvaplot$CONDICION == k, ]
+        lines(condiplot$Hill, condiplot$value, lwd = 3, col = if (k == "Disease") "orange" else "skyblue")
+        
+      }
+      
+    } 
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)), 
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, 250, 50), labels = FALSE)
+    title(xlab = "Hill diversity", line=2.5)
+    # Background grid
+    grid()
+    # Subset sampling site
+    parcelaplot <- hillframe.long[hillframe.long$PARCELA == i, ]
+    
+    for (j in unique(hillframe.long$UVA)) {
+      
+      # Subset replicate
+      uvaplot <- parcelaplot[parcelaplot$UVA == j, ]
+      
+      for (k in unique(hillframe.long$CONDICION)) {
+        
+        # Subset status and plot
+        condiplot <- uvaplot[uvaplot$CONDICION == k, ]
+        lines(condiplot$Hill, condiplot$value, lwd = 3, col = if (k == "Disease") "orange" else "skyblue")
+        
+      }
+      
+    }
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
+
+## Save average plot lines
+
+```{r}
+datalm <- hillframe.long[hillframe.long$PARCELA == "Chestnut", ]
+datalm$logval <- log(datalm$value)
+plot(datalm$Hill, datalm$logval)
+plot(datalm$Hill, datalm$value, col = datalm$CONDICION)
+jj <- geepack::geeglm(value ~ Hill*CONDICION + I(Hill^2)*CONDICION, id = UVA, family=Gamma(link="log"), data = datalm)
+jj <- glm(value ~ Hill*CONDICION + I(Hill^2)*CONDICION, family=Gamma(link="log"), data = datalm)
+
+summary(jj, dispersion=1)
+plot(jj)
+
+plot(datalm$Hill, jj$fitted.values, col = datalm$CONDICION, pch = 17)
+points(datalm$Hill, datalm$value, col = datalm$CONDICION)
+```
+
+
+```{r, fig.width=15, fig.height=6}
+
+png(filename=paste(folder, "figs/hill_diversity_lines_average.png", sep=""), type="cairo",
+      units="in", width=15, height=6.2, pointsize=12,
+      res=300)
+
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.8,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1.2, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+
+# Plot
+for (i in unique(hillframe.long$PARCELA)) {
+  
+  if (i == "Chestnut") {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)),
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0,250,50), labels = seq(0,250,50))
+    title(xlab = "Hill diversity", line=2.5)
+    
+    # Background grid
+    grid()
+    # Subset sampling site
+    parcelaplot <- hillframe.long[hillframe.long$PARCELA == i, ]
+    
+    for (k in unique(hillframe.long$CONDICION)) {
+      
+      # Subset status and plot
+      condiplot <- parcelaplot[parcelaplot$CONDICION == k, ]
+      # Estimate mean
+      mean.condiplot <- aggregate(value ~ Hill, condiplot, mean)
+      sd.condiplot <- aggregate(value ~ Hill, condiplot, function(x) sd(x)/sqrt(3))
+      polygon(x = c(sd.condiplot$Hill, rev(sd.condiplot$Hill)), 
+              y = c(mean.condiplot$value + sd.condiplot$value, rev(mean.condiplot$value - sd.condiplot$value)), 
+              col = if (k == "Disease") scales::alpha("orange", 0.2) else scales::alpha("skyblue", 0.2),
+              border = NA)
+      lines(mean.condiplot$Hill, mean.condiplot$value, lwd = 3, col = if (k == "Disease") "orange" else "skyblue")
+      
+      
+    } 
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)), 
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, 250, 50), labels = FALSE)
+    title(xlab = "Hill diversity", line=2.5)
+    # Background grid
+    grid()
+    # Subset sampling site
+    parcelaplot <- hillframe.long[hillframe.long$PARCELA == i, ]
+    
+    for (k in unique(hillframe.long$CONDICION)) {
+      
+      # Subset status and plot
+      condiplot <- parcelaplot[parcelaplot$CONDICION == k, ]
+      # Estimate mean
+      mean.condiplot <- aggregate(value ~ Hill, condiplot, mean)
+      sd.condiplot <- aggregate(value ~ Hill, condiplot, function(x) sd(x)/sqrt(3))
+      polygon(x = c(sd.condiplot$Hill, rev(sd.condiplot$Hill)), 
+              y = c(mean.condiplot$value + sd.condiplot$value, rev(mean.condiplot$value - sd.condiplot$value)), 
+              col = if (k == "Disease") scales::alpha("orange", 0.2) else scales::alpha("skyblue", 0.2),
+              border = NA)
+      lines(mean.condiplot$Hill, mean.condiplot$value, lwd = 3, col = if (k == "Disease") "orange" else "skyblue")
+      
+    }
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
+
+## Scatterplot for -1, 0, 1
+
+```{r, fig.width=15}
+png(filename=paste(folder, "figs/hill_diversity_scatter.png", sep=""), type="cairo",
+      units="in", width=15, height=5.5, pointsize=12,
+      res=300)
+
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+# Color vector
+colvec <- c(rep(scales::alpha("orange", 0.5), 3), 
+            rep(scales::alpha("skyblue", 0.5), 3))
+
+# Wilcox list to store for later
+wilcoxList <- list()
+
+# Plot
+for (i in unique(hillframe.long$PARCELA)) {
+  
+  # Subset sampling site
+  parcelaplot <- hillframe.long[hillframe.long$PARCELA == i, ]
+  
+  # Subset Hill values of -1, 0, 1
+  hillplot <- rbind(subset(parcelaplot, Hill == -1),
+                    subset(parcelaplot, Hill == 0),
+                    subset(parcelaplot, Hill == 1))
+  
+  # Wilcox test with Holm p-val adjustment
+  wilcoxPvals <- c(wilcox.test(value ~ CONDICION, hillplot[hillplot$Hill == -1, ])$p.value,
+                   wilcox.test(value ~ CONDICION, hillplot[hillplot$Hill == 0, ])$p.value,
+                   wilcox.test(value ~ CONDICION, hillplot[hillplot$Hill == 1, ])$p.value)
+  wilcoxAdjust <- p.adjust(wilcoxPvals, method = "holm")
+  # Store
+  wilcoxList[[i]] <- list(pvals = wilcoxPvals, adjust = wilcoxAdjust)
+  
+  if (i == "Chestnut") {
+    
+    plot(NULL, xlim = c(1,3.7), ylim = c(0, max(hillframe.long$value) + 20), 
+         xaxt = "n", yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, max(hillframe.long$value) + 20, 50), labels = seq(0, max(hillframe.long$value) + 20, 50))
+    title(xlab = "Hill diversity", line=2.5)
+
+    # Background grid
+    grid()
+    points(c(rep(1.2,3), rep(1.5,3)), hillplot[hillplot$Hill == -1, "value"], pch = 21, 
+           bg = colvec)
+    points(c(rep(2.2,3), rep(2.5,3)), hillplot[hillplot$Hill == 0, "value"], pch = 21, 
+           bg = colvec)
+    points(c(rep(3.2,3), rep(3.5,3)), hillplot[hillplot$Hill == 1, "value"], pch = 21, 
+           bg = colvec)
+    axis(1, at = c(1.35, 2.35, 3.35), labels = c("-1", "0", "1"))
+    
+  } else {
+    
+    plot(NULL, xlim = c(1,3.7), ylim = c(0, max(hillframe.long$value) + 20), 
+         xaxt = "n", yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, max(hillframe.long$value) + 20, 50), labels = FALSE)
+        title(xlab = "Hill diversity", line=2.5)
+
+    # Background grid
+    grid()
+    points(c(rep(1.2,3), rep(1.5,3)), hillplot[hillplot$Hill == -1, "value"], pch = 21, 
+           bg = colvec)
+    points(c(rep(2.2,3), rep(2.5,3)), hillplot[hillplot$Hill == 0, "value"], pch = 21, 
+           bg = colvec)
+    points(c(rep(3.2,3), rep(3.5,3)), hillplot[hillplot$Hill == 1, "value"], pch = 21, 
+           bg = colvec)
+    axis(1, at = c(1.35, 2.35, 3.35), labels = c("-1", "0", "1"))
+    
+  }
+  
+  if (any(wilcoxAdjust < 0.05)) {
+    
+    xpos <- c(1.35, 2.35, 3.35)[wilcoxAdjust < 0.05]
+    ypos <- c(max(hillplot[hillplot$Hill == -1, "value"]),
+              max(hillplot[hillplot$Hill == 0, "value"]),
+              max(hillplot[hillplot$Hill == 1, "value"]))[wilcoxAdjust < 0.05]
+    text(xpos, ypos + 10, labels = rep("*", length(xpos)))
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+```
+
+# Compositional analysis
+
+https://github.com/ggloor
+
+https://www.r-bloggers.com/2021/03/measuring-effect-size-in-aldex2/
+
+https://arxiv.org/abs/1809.02623
+
+https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0067019
+
+https://www.bioconductor.org/packages/devel/bioc/vignettes/ALDEx2/inst/doc/ALDEx2_vignette.html#6_Troubleshooting_datasets
+
+## Calculations
+
+```{r}
+set.seed(12345)
+
+###########################
+# Per PARCELA
+for (i in unique(data24.meta$PARCELA)) {
+  
+  ###################################
+  # Filter the dataset
+  uvacode <- data24.meta[data24.meta$PARCELA == i, "UVA"]
+  # Line for min analysis
+  # f <- codaSeq.filter(data24.res[, uvacode], min.reads=1000, min.prop=0.001, min.occurrence=0.05, samples.by.row=FALSE)
+  f <- codaSeq.filter(data24.res[, uvacode], min.reads=5000, min.prop=0, min.occurrence=0, samples.by.row=FALSE)
+  # replace 0 values with an estimate
+  f.n0 <- cmultRepl(t(f), method="CZM", label=0)
+  # generate the CLR values for plotting later
+  f.clr <- codaSeq.clr(f.n0)
+  # Generate the aldex object for Expected values
+  conds <- c(rep("D", 3), rep("H", 3))
+  
+  ####################################################
+  # Expected value of differential abundance using ALDEx2
+  # Change the mc.samples from 256 to 1000 to observe more reproducible rho values
+  # estimate the distribution of CLR values
+  f.x <- aldex.clr(f, conds, mc.samples=1000, verbose=FALSE)
+  # generate the expected CLR value for each OTU
+  # along with expected value of effect sizes
+  f.e <- aldex.effect(f.x, conds, CI = T, include.sample.summary=TRUE, verbose=FALSE)
+  # calculate expected P values
+  # f.t <- aldex.ttest(f.x, conds)
+  f.t <- aldex.ttest(f.x)
+  
+  # select 'significant' features
+  low.p <- which(f.t$we.eBH < 0.05 | f.t$wi.eBH < 0.05)
+  high.e <- which(abs(f.e$effect) >=1)
+  ci.nonzero <- which(!data.table::between(0, f.e$effect.low, f.e$effect.high))
+  sgn <- sign(f.e$effect.low) == sign(f.e$effect.high) #equivalent to ci.nonzero
+  
+  # get a matrix of E(CLR) values
+  # samples by row
+  # use for ordination and dendrogram
+  E.E.clr <- t(f.e[,grep("rab.sample", colnames(f.e))])
+  rownames(E.E.clr) <- gsub("rab.sample.", "", rownames(E.E.clr))
+  exp <- apply(E.E.clr, 1, function(x) 2^x)
+  E.clr <- t(apply(exp, 2, function(x) log2(x) - mean(log2(x)) ))
+  
+  ############################################
+  # perform a singular value decomposition
+  pcx <- prcomp(E.clr)
+  # calculate percent variance explained for the axis labels
+  pc1 <- round(pcx$sdev[1]^2/sum(pcx$sdev^2),2)
+  pc2 <- round(pcx$sdev[2]^2/sum(pcx$sdev^2),2)
+  
+  # Anosim between groups using Aitchison distance for dendrogram
+  dist.clr <- dist(E.clr)
+  ano <- anosim(dist.clr, conds, permutations=999)
+  
+  # make the dendrogram
+  hc <- as.dendrogram(hclust(dist.clr, method="ward.D2"))
+  hcd <- hclust(dist.clr, method="ward.D2")
+  
+  ##########################################################
+  # using the propr package to calculate E(phi) and E(rho)
+  #x <- ALDEx2::aldex.clr(f, conds, denom = "all", verbose=FALSE, mc.samples=128)
+  # rho.all <- propr::aldex2propr(f.x, how = "perb")
+  # diag(rho.all@matrix) <- 0
+  # rownames(rho.all@matrix) <- colnames(rho.all@counts)
+  # colnames(rho.all@matrix) <- colnames(rho.all@counts)
+  
+  # save
+  savelist <- list(ano, ci.nonzero, colLab, conds, dist.clr, E.clr, E.E.clr, exp, f, f.clr, f.e, f.n0, f.t, f.x, 
+                   hc, hcd, high.e, low.p, pc1, pc2, pcx, sgn, uvacode)
+  names(savelist) <- c("ano", "ci.nonzero", "colLab", "conds", "dist.clr", "E.clr", "E.E.clr", "exp", "f", "f.clr", "f.e", "f.n0", 
+                       "f.t", "f.x", "hc", "hcd", "high.e", "low.p", "pc1", "pc2", "pcx", "sgn", "uvacode" )
+  saveRDS(savelist, paste(folder, i, "_coda_data.RDS", sep=""))
+  
+}
+
+```
+
+### Save clr abundances
+
+```{r}
+clrlist <- list()
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+  loadlist <- readRDS(paste(folder, i, "_coda_data.RDS", sep=""))
+  list2env(loadlist, .GlobalEnv)
+  f.trans <- data.frame(colnames(f.clr), t(f.clr))
+  colnames(f.trans) <- c("Genus", rep("Declined", 3), rep("Healthy", 3))
+  clrlist[[i]] <- f.trans
+  
+}
+
+wb <- createWorkbook()
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+    sheet <- createSheet(wb, i)
+    addDataFrame(clrlist[[i]], sheet=sheet, startColumn=1, row.names=FALSE, showNA = T)
+    
+}
+
+saveWorkbook(wb, "coda_clr.xlsx")
+
+```
+
+## Plots per parcela
+
+### PCA, SVD, Aitchison, Dendrogram, ALDEx2 diff abund
+
+```{r, fig.width=8, fig.height=8}
+for (i in unique(data24.meta$PARCELA)) {
+  
+  loadlist <- readRDS(paste(folder, i, "_coda_data.RDS", sep=""))
+  list2env(loadlist, .GlobalEnv)
+  
+  # Blue for non-zero CI (sgn) or wignificant Wilcox/Welch (low.p)
+  sigBlue <- sgn
+  
+  png(filename=paste(folder, i, "_coda_ordination.png", sep=""), type="cairo",
+      units="in", width=8, height=8, pointsize=12,
+      res=300)
+  
+  par(mfrow=c(2,2))
+  
+  ##########################
+  # PCA biplot
+  xlab <- paste("PC1: ", pc1, sep="")
+  ylab <- paste("PC2: ", pc2, sep="")
+  biplot(pcx, cex=c(1,0.4), var.axes=F, scale=1, xlab=xlab, ylab=ylab)
+  
+  #####################################
+  # SVD
+  plot(pcx$rotation[, 1], pcx$rotation[, 2], main="loadings", xlab=xlab, cex=0.7,
+       ylab=ylab, col=rgb(0,0,0,0.3), pch=19)
+  points(pcx$rotation[,1][high.e], pcx$rotation[,2][high.e], cex=0.7, 
+         col=rgb(1,0,0,1), pch = 19)
+  # blue points for taxa pair with rho closest to 1
+  # rhomax <- rownames(which(rho.all@matrix == max(rho.all@matrix), arr.ind = TRUE))  
+  # points(pcx$rotation[rhomax,1], pcx$rotation[rhomax,2],
+  points(pcx$rotation[sigBlue,1], pcx$rotation[sigBlue,2],
+         cex=0.9, col=rgb(0,0,1,0.8))
+  
+  ######################
+  # Aitchison distance between samples
+  plot(pcx$x[, 1], pcx$x[, 2],
+       main = "Samples", xlab = xlab, ylab = ylab,
+       col=c(rep("orange", 3), rep("skyblue", 3)), pch = 19)
+  
+  
+  #####################
+  # Dendrogram 
+  # coloring from https://rpubs.com/gaston/dendrograms
+  # using dendrapply
+  clusDendro <- dendrapply(hc, colLab)
+  plot(clusDendro, main=paste("Aitchison distance, Ward.D2 Cluster, p = ", ano$signif, sep=""))
+  
+  dev.off()
+  
+  #################################
+  # ALDEx2 differential abundance
+  png(filename=paste(folder, i, "_coda_aldex.png", sep=""), type="cairo",
+      units="in", width=8, height=4, pointsize=12,
+      res=300)
+  
+  par(mfrow=c(1,2))
+  
+  plot(f.e$rab.all, f.e$diff.btw, pch=19, cex=0.3, col="grey", xlab="Abundance", ylab="Difference", main="Bland-Altman")
+  points(f.e$rab.all[high.e], f.e$diff.btw[high.e], pch=19, cex=0.5, col="red")
+  points(f.e$rab.all[sigBlue], f.e$diff.btw[sigBlue], cex=0.7, col="blue")
+  mtext("Declined", 2, line = 2, at = min(f.e$diff.btw), 
+        col = "grey", cex = 0.8)
+  mtext("Healthy", 2, line = 2, at = max(f.e$diff.btw), 
+        col = "grey", cex = 0.8)
+  
+  plot(f.e$diff.win, f.e$diff.btw, pch=19, cex=0.3, col="grey",xlab="Dispersion", ylab="Difference", main="Effect")
+  points(f.e$diff.win[high.e], f.e$diff.btw[high.e], pch=19, cex=0.5, col="red")
+  points(f.e$diff.win[sigBlue], f.e$diff.btw[sigBlue], cex=0.7, col="blue")
+  abline(0,1, lty=2, col="grey")
+  abline(0,-1, lty=2, col="grey")
+  mtext("Declined", 2, line = 2, at = min(f.e$diff.btw), 
+        col = "grey", cex = 0.8)
+  mtext("Healthy", 2, line = 2, at = max(f.e$diff.btw), 
+        col = "grey", cex = 0.8)
+  
+  dev.off()
+  
+  #############################
+  # Save effect and CI as csv
+  
+  if (length(high.e) == 0) {
+    
+    effect.frame <- data.frame(Parcela = i,
+                               Taxa = NA, 
+                               diff.btw = NA,
+                               diff.wtn = NA,
+                               Effect = NA,
+                               Effec.cilow = NA,
+                               Effec.cihigh = NA,
+                               CIzero = NA,
+                               we.pval = NA,
+                               wi.pval = NA,
+                               we.sig = NA,
+                               wi.sig = NA,
+                               overlap = NA) 
+    
+  } else {
+    
+    effect.frame <- data.frame(Parcela = rep(i, length(sgn[high.e])),
+                               Taxa = as.vector(rownames(f.e)[high.e]),
+                               diff.btw = as.vector(f.e$diff.btw[high.e]),
+                               diff.wtn = as.vector(f.e$diff.win[high.e]),                        
+                               Effect = as.vector(f.e$effect[high.e]),
+                               Effec.cilow = as.vector(f.e$effect.low[high.e]),
+                               Effec.cihigh = as.vector(f.e$effect.high[high.e]),
+                               CIzero = sgn[high.e],
+                               we.pval = as.vector(f.t$we.eBH[high.e]),
+                               wi.pval = as.vector(f.t$wi.eBH[high.e]),
+                               we.sig = as.vector(f.t$we.eBH[high.e]) < 0.05,
+                               wi.sig = as.vector(f.t$wi.eBH[high.e]) < 0.05,
+                               overlap = as.vector(f.e$overlap[high.e])) 
+    
+  }
+  
+  write.csv(effect.frame, paste(folder, i, "_coda_effect.csv", sep=""))
+  
+}
+
+```
+
+### Save excel
+
+```{r}
+
+# Load csv again and save as excel file
+setwd(folder)
+pairfiles <- list.files(pattern = "csv")
+pairframes <- lapply(pairfiles, function(x) read.csv(x))
+names(pairframes) <- pairfiles
+
+wb <- createWorkbook()
+
+for (i in pairfiles) {
+  
+    sheet <- createSheet(wb, i)
+    addDataFrame(pairframes[[i]], sheet=sheet, startColumn=1, row.names=FALSE, showNA = T)
+    
+}
+
+saveWorkbook(wb, "coda_pvals.xlsx")
+
+```
+
+## Plots together
+
+### PCA, SVD, Aitchison, Dendrogram
+
+```{r, fig.width=16, fig.height=16}
+
+png(filename=paste(folder, "figs/coda_ordination_blueCI.png", sep=""), type="cairo",
+    units="in", width=16, height=16, pointsize=12,
+    res=300)
+
+par(mfrow=c(4,4))
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+  loadlist <- readRDS(paste(folder, i, "_coda_data.RDS", sep=""))
+  list2env(loadlist, .GlobalEnv)
+  
+  # Blue for non-zero CI (sgn) or wignificant Wilcox/Welch (low.p)
+  sigBlue <- sgn
+  
+  ##########################
+  # PCA biplot
+  xlab <- paste("PC1: ", pc1, sep="")
+  ylab <- paste("PC2: ", pc2, sep="")
+  biplot(pcx, cex=c(1,0.4), var.axes=F, scale=1, xlab=xlab, ylab=ylab)
+  
+  #####################################
+  # SVD
+  plot(pcx$rotation[, 1], pcx$rotation[, 2], main="loadings", xlab=xlab, cex=0.7,
+       ylab=ylab, col=rgb(0,0,0,0.3), pch=19)
+  points(pcx$rotation[,1][high.e], pcx$rotation[,2][high.e], cex=0.7, 
+         col=rgb(1,0,0,1), pch = 19)
+  # blue points for taxa pair with rho closest to 1
+  # rhomax <- rownames(which(rho.all@matrix == max(rho.all@matrix), arr.ind = TRUE))  
+  # points(pcx$rotation[rhomax,1], pcx$rotation[rhomax,2],
+  points(pcx$rotation[sigBlue,1], pcx$rotation[sigBlue,2],
+         cex=0.9, col=rgb(0,0,1,0.8))
+  
+  ######################
+  # Aitchison distance between samples
+  plot(pcx$x[, 1], pcx$x[, 2],
+       main = "Samples", xlab = xlab, ylab = ylab,
+       col=c(rep("orange", 3), rep("skyblue", 3)), pch = 19)
+  
+  
+  #####################
+  # Dendrogram 
+  # coloring from https://rpubs.com/gaston/dendrograms
+  # using dendrapply
+  clusDendro <- dendrapply(hc, colLab)
+  plot(clusDendro, main=paste("Aitchison distance, Ward.D2 Cluster, p = ", ano$signif, sep=""))
+  
+}
+
+dev.off()
+
+```
+
+### ALDEx2 diff abund
+
+```{r, fig.width=16, fig.height=8}
+
+# ALDEx2 differential abundance
+png(filename=paste(folder, "figs/coda_aldex.png", sep=""), type="cairo",
+    units="in", width=16, height=5.5, pointsize=12,
+    res=300)
+
+# par(mfrow=c(1,4), cex = 1)
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5), nrow = 1, ncol = 5, byrow = TRUE), heights = 5.5, widths = c(0.8,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1.2, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0.1,1), ylim = c(-10,10), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="Difference", line=0)
+# Category labels 
+mtext("Declined", 2, line = -0.5, at = -10, 
+      col = "grey", cex = 1.5)
+mtext("Healthy", 2, line = -0.5, at = 10, 
+      col = "grey", cex = 1.5)
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+  loadlist <- readRDS(paste(folder, i, "_coda_data.RDS", sep=""))
+  list2env(loadlist, .GlobalEnv)
+  
+  # Blue for non-zero CI (sgn) or wignificant Wilcox/Welch (low.p)
+  sigBlue <- sgn
+  
+  if (i == "Chestnut") {
+    
+    # Plot all points in grey
+    plot(f.e$diff.win, f.e$diff.btw, pch=19, cex=0.5, xlim = c(0.2,12), ylim = c(-10, 10), 
+         col="grey",xlab=NA, ylab=NA, yaxt = "n", xaxt = "n", main=i)
+    axis(2, at = seq(-10, 10, 5), labels = seq(-10, 10, 5))
+    axis(1, at = seq(0, 12, 2), labels = seq(0, 12, 2))
+    title(xlab="Dispersion", line=2.5)
+    # Rare species in black
+    points(f.e$diff.win[f.e$rab.all < 0], f.e$diff.btw[f.e$rab.all < 0], pch=19, cex=0.5, col="black")
+    # Effect > 1 in red
+    points(f.e$diff.win[high.e], f.e$diff.btw[high.e], pch=19, cex=0.7, col="red")
+    # CI nonzero in blue
+    points(f.e$diff.win[sigBlue], f.e$diff.btw[sigBlue], cex=0.9, col="blue")
+    abline(0,1, lty=2, col="darkgrey")
+    abline(0,-1, lty=2, col="darkgrey") 
+    abline(h=0, lty="dashed", col = "lightgrey")
+    
+  } else {
+    
+    # Plot all points in grey
+    plot(f.e$diff.win, f.e$diff.btw, pch=19, cex=0.5, xlim = c(0.2,12), ylim = c(-10, 10), 
+         col="grey",xlab=NA, ylab=NA, yaxt = "n",  xaxt="n", main=i)
+    axis(2, at = seq(-10, 10, 5), labels = FALSE)
+    axis(1, at = seq(0, 12, 2), labels = seq(0, 12, 2))
+    title(xlab="Dispersion", line=2.5)
+    # Rare species in black
+    points(f.e$diff.win[f.e$rab.all < 0], f.e$diff.btw[f.e$rab.all < 0], pch=19, cex=0.5, col="black")
+    # Effect > 1 in red
+    points(f.e$diff.win[high.e], f.e$diff.btw[high.e], pch=19, cex=0.7, col="red")
+    # CI nonzero in blue
+    points(f.e$diff.win[sigBlue], f.e$diff.btw[sigBlue], cex=0.9, col="blue")
+    abline(0,1, lty=2, col="darkgrey")
+    abline(0,-1, lty=2, col="darkgrey") 
+    abline(h=0, lty="dashed", col = "lightgrey")
+    
+  }
+  
+}
+
+dev.off()
+
+```
+
+### Bland-Altman
+
+```{r, fig.width=16, fig.height=8}
+
+# ALDEx2 differential abundance
+png(filename=paste(folder, "figs/coda_blandaltman.png", sep=""), type="cairo",
+    units="in", width=16, height=5.5, pointsize=12,
+    res=300)
+
+# par(mfrow=c(1,4), cex = 1)
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5), nrow = 1, ncol = 5, byrow = TRUE), heights = 5.5, widths = c(0.8,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1.2, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0.1,1), ylim = c(-10,10), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="Difference", line=0)
+# Category labels 
+mtext("Declined", 2, line = -0.5, at = -10, 
+      col = "grey", cex = 1.5)
+mtext("Healthy", 2, line = -0.5, at = 10, 
+      col = "grey", cex = 1.5)
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+  loadlist <- readRDS(paste(folder, i, "_coda_data.RDS", sep=""))
+  list2env(loadlist, .GlobalEnv)
+  
+  # Blue for non-zero CI (sgn) or wignificant Wilcox/Welch (low.p)
+  sigBlue <- sgn
+  
+  if (i == "Chestnut") {
+    
+    # Plot all points in grey
+    plot(f.e$rab.all, f.e$diff.btw, pch=19, cex=0.5, xlim = c(-2,11), ylim = c(-10, 10), 
+         col="grey",xlab=NA, ylab=NA, yaxt = "n", xaxt = "n", main=i)
+    axis(2, at = seq(-10, 10, 5), labels = seq(-10, 10, 5))
+    axis(1, at = seq(-2, 10, 2), labels = seq(-2, 10, 2))
+    title(xlab="Abundance (clr)", line=2.5)
+    # Rare species in black
+    points(f.e$rab.all[f.e$rab.all < 0], f.e$diff.btw[f.e$rab.all < 0], pch=19, cex=0.5, col="black")
+    # Effect > 1 in red
+    points(f.e$rab.all[high.e], f.e$diff.btw[high.e], pch=19, cex=0.7, col="red")
+    # CI nonzero in blue
+    points(f.e$rab.all[sigBlue], f.e$diff.btw[sigBlue], cex=0.9, col="blue")
+    abline(h=0, lty="dashed", col = "lightgrey")
+    abline(v=0, lty="dashed", col = "lightgrey")
+    
+  } else {
+    
+    # Plot all points in grey
+    plot(f.e$rab.all, f.e$diff.btw, pch=19, cex=0.5, xlim = c(-2,11), ylim = c(-10, 10), 
+         col="grey",xlab=NA, ylab=NA, yaxt = "n",  xaxt="n", main=i)
+    axis(2, at = seq(-10, 10, 5), labels = FALSE)
+    axis(1, at = seq(-2, 10, 2), labels = seq(-2, 10, 2))
+    title(xlab="Abundance (clr)", line=2.5)
+    # Rare species in black
+    points(f.e$rab.all[f.e$rab.all < 0], f.e$diff.btw[f.e$rab.all < 0], pch=19, cex=0.5, col="black")
+    # Effect > 1 in red
+    points(f.e$rab.all[high.e], f.e$diff.btw[high.e], pch=19, cex=0.7, col="red")
+    # CI nonzero in blue
+    points(f.e$rab.all[sigBlue], f.e$diff.btw[sigBlue], cex=0.9, col="blue")
+    abline(h=0, lty="dashed", col = "lightgrey")
+    abline(v=0, lty="dashed", col = "lightgrey")
+    
+  }
+  
+}
+
+dev.off()
+
+```
+
+#### CI plots
+
+```{r, fig.width=21, fig.height=8}
+
+codaRes <- lapply(list.files(path = "coda_results/genus/", pattern = "csv", full.names = T),
+                  function(x) read.csv(x))
+
+names(codaRes) <- unique(data24.meta$PARCELA)
+codaFrame <- do.call(rbind, codaRes)
+codaFrame <- codaFrame[!is.na(codaFrame$Effect), ]
+codaFrame <- codaFrame[order(codaFrame$Taxa), ]
+yaxis.Taxa <- unique(codaFrame$Taxa)
+codaFrame$yaxis <- sapply(codaFrame$Taxa, function(x) which(yaxis.Taxa == x))
+codaFrame$color <- sapply(codaFrame$Effect, function(x) if (x < 0) "orange" else "skyblue")
+codaFrame[which(codaFrame$CIzero == FALSE), "color"] <- "gray"
+
+png(filename=paste(folder, "figs/coda_CIplots.png", sep=""), type="cairo",
+      units="in", width=21, height=12, pointsize=12,
+      res=300)
+
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(11, 0.5), widths = c(1.7,5,5,5,5))
+par(cex = 1.8, mai = c(1.6, 0.3, 0.8, 0.1))
+
+plot(NULL, xlim = c(0,1), ylim = c(length(yaxis.Taxa),1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+
+for (i in unique(data24.meta$PARCELA)) {
+  
+  if (i == "Chestnut") {
+    
+    # par(mar = c(5.1, 6.1, 4.1, 0.5))
+    ciplot <- codaFrame[codaFrame$Parcela == i, ]
+    
+    plot(NULL, xlim = c(min(ciplot$Effec.cilow), max(ciplot$Effec.cihigh)), ylim = c(length(yaxis.Taxa), 1), 
+         main = i, yaxt = "n", ylab = NA, xlab = NA)
+    axis(2, at = 1:length(yaxis.Taxa), labels = yaxis.Taxa, las = 2,  cex.axis = 0.6)
+    title(xlab = "Effect", line=2.5)
+    abline(v=0, col="black", lty="dashed")
+    abline(h=1:length(yaxis.Taxa), col = "lightgray", lty = "dotted", lwd = 0.5)
+    points(ciplot$Effect, ciplot$yaxis, pch = 19, col = ciplot$color)
+    segments(ciplot$Effec.cilow, ciplot$yaxis, ciplot$Effec.cihigh, ciplot$yaxis, col = ciplot$color)
+    segments(ciplot$Effec.cilow, ciplot$yaxis - 0.4, ciplot$Effec.cilow, ciplot$yaxis + 0.4, col = ciplot$color)
+    segments(ciplot$Effec.cihigh, ciplot$yaxis - 0.4, ciplot$Effec.cihigh, ciplot$yaxis + 0.4, col = ciplot$color)
+    
+  } else {
+    
+    ciplot <- codaFrame[codaFrame$Parcela == i, ]
+    
+    plot(NULL, xlim = c(min(ciplot$Effec.cilow), max(ciplot$Effec.cihigh)), ylim = c(length(yaxis.Taxa), 1), 
+         main = i, yaxt = "n", ylab = NA, xlab = NA)
+    axis(2, at = 1:length(yaxis.Taxa), las = 2, cex.axis = 0.7, labels = FALSE)
+    title(xlab = "Effect", line=2.5)
+    abline(v=0, col="black", lty="dashed")
+    abline(h=1:length(yaxis.Taxa), col = "lightgray", lty = "dotted", lwd = 0.5)
+    points(ciplot$Effect, ciplot$yaxis, pch = 19, col = ciplot$color)
+    segments(ciplot$Effec.cilow, ciplot$yaxis, ciplot$Effec.cihigh, ciplot$yaxis, col = ciplot$color)
+    segments(ciplot$Effec.cilow, ciplot$yaxis - 0.4, ciplot$Effec.cilow, ciplot$yaxis + 0.4, col = ciplot$color)
+    segments(ciplot$Effec.cihigh, ciplot$yaxis - 0.4, ciplot$Effec.cihigh, ciplot$yaxis + 0.4, col = ciplot$color)
+    
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
+
+## Calculations per condition
+
+```{r}
+set.seed(12345)
+
+###################################
+# Filter the dataset
+uvacode <- data24.meta$UVA
+# Line for min analysis
+# f <- codaSeq.filter(data24.res[, uvacode], min.reads=1000, min.prop=0.001, min.occurrence=0.05, samples.by.row=FALSE)
+f <- codaSeq.filter(data24.res[, uvacode], min.reads=5000, min.prop=0, min.occurrence=0, samples.by.row=FALSE)
+# replace 0 values with an estimate
+f.n0 <- cmultRepl(t(f), method="CZM", label=0)
+# generate the CLR values for plotting later
+f.clr <- codaSeq.clr(f.n0)
+# Generate the aldex object for Expected values
+conds <- data24.meta$CONDICION
+
+####################################################
+# Expected value of differential abundance using ALDEx2
+# Change the mc.samples from 256 to 1000 to observe more reproducible rho values
+# estimate the distribution of CLR values
+f.x <- aldex.clr(f, conds, mc.samples=1000, verbose=FALSE)
+# generate the expected CLR value for each OTU
+# along with expected value of effect sizes
+f.e <- aldex.effect(f.x, conds, CI = T, include.sample.summary=TRUE, verbose=FALSE)
+# calculate expected P values
+f.t <- aldex.ttest(f.x)
+
+# select 'significant' features
+low.p <- which(f.t$we.eBH < 0.05 | f.t$wi.eBH < 0.05)
+high.e <- which(abs(f.e$effect) >=1)
+ci.nonzero <- which(!data.table::between(0, f.e$effect.low, f.e$effect.high))
+sgn <- sign(f.e$effect.low) == sign(f.e$effect.high) #equivalent to ci.nonzero
+
+# get a matrix of E(CLR) values
+# samples by row
+# use for ordination and dendrogram
+E.E.clr <- t(f.e[,grep("rab.sample", colnames(f.e))])
+rownames(E.E.clr) <- gsub("rab.sample.", "", rownames(E.E.clr))
+exp <- apply(E.E.clr, 1, function(x) 2^x)
+E.clr <- t(apply(exp, 2, function(x) log2(x) - mean(log2(x)) ))
+
+############################################
+# perform a singular value decomposition
+pcx <- prcomp(E.clr)
+# calculate percent variance explained for the axis labels
+pc1 <- round(pcx$sdev[1]^2/sum(pcx$sdev^2),2)
+pc2 <- round(pcx$sdev[2]^2/sum(pcx$sdev^2),2)
+
+# Anosim between groups using Aitchison distance for dendrogram
+dist.clr <- dist(E.clr)
+ano <- anosim(dist.clr, conds, permutations=999)
+
+# make the dendrogram
+hc <- as.dendrogram(hclust(dist.clr, method="ward.D2"))
+hcd <- hclust(dist.clr, method="ward.D2")
+
+##########################################################
+# using the propr package to calculate E(phi) and E(rho)
+#x <- ALDEx2::aldex.clr(f, conds, denom = "all", verbose=FALSE, mc.samples=128)
+# rho.all <- propr::aldex2propr(f.x, how = "perb")
+# diag(rho.all@matrix) <- 0
+# rownames(rho.all@matrix) <- colnames(rho.all@counts)
+# colnames(rho.all@matrix) <- colnames(rho.all@counts)
+
+# save
+savelist <- list(ano, ci.nonzero, colLab, conds, dist.clr, E.clr, E.E.clr, exp, f, f.clr, f.e, f.n0, f.t, f.x, 
+                 hc, hcd, high.e, low.p, pc1, pc2, pcx, sgn, uvacode)
+names(savelist) <- c("ano", "ci.nonzero", "colLab", "conds", "dist.clr", "E.clr", "E.E.clr", "exp", "f", "f.clr", "f.e", "f.n0", 
+                     "f.t", "f.x", "hc", "hcd", "high.e", "low.p", "pc1", "pc2", "pcx", "sgn", "uvacode" )
+saveRDS(savelist, paste(folder, "condition_coda_data.RDS", sep=""))
+  
+
+```
+
+## Plots per condition
+
+### PCA, SVD, Aitchison, Dendrogram, ALDEx2 diff abund
+
+```{r, fig.width=8, fig.height=8}
+
+loadlist <- readRDS(paste(folder, "condition_coda_data.RDS", sep=""))
+list2env(loadlist, .GlobalEnv)
+
+# Blue for non-zero CI (sgn) or wignificant Wilcox/Welch (low.p)
+sigBlue <- sgn
+
+png(filename=paste(folder, "condition_coda_ordination.png", sep=""), type="cairo",
+    units="in", width=8, height=8, pointsize=12,
+    res=300)
+
+par(mfrow=c(2,2))
+
+##########################
+# PCA biplot
+xlab <- paste("PC1: ", pc1, sep="")
+ylab <- paste("PC2: ", pc2, sep="")
+biplot(pcx, cex=c(1,0.4), var.axes=F, scale=1, xlab=xlab, ylab=ylab)
+
+#####################################
+# SVD
+plot(pcx$rotation[, 1], pcx$rotation[, 2], main="loadings", xlab=xlab, cex=0.7,
+     ylab=ylab, col=rgb(0,0,0,0.3), pch=19)
+points(pcx$rotation[,1][high.e], pcx$rotation[,2][high.e], cex=0.7, 
+       col=rgb(1,0,0,1), pch = 19)
+# blue points for taxa pair with rho closest to 1
+# rhomax <- rownames(which(rho.all@matrix == max(rho.all@matrix), arr.ind = TRUE))  
+# points(pcx$rotation[rhomax,1], pcx$rotation[rhomax,2],
+points(pcx$rotation[sigBlue,1], pcx$rotation[sigBlue,2],
+       cex=0.9, col=rgb(0,0,1,0.8))
+
+######################
+# Aitchison distance between samples
+plot(pcx$x[, 1], pcx$x[, 2],
+     main = "Samples", xlab = xlab, ylab = ylab,
+     col=c(rep("orange", 3), rep("skyblue", 3)), pch = 19)
+
+
+#####################
+# Dendrogram 
+# coloring from https://rpubs.com/gaston/dendrograms
+# using dendrapply
+clusDendro <- dendrapply(hc, colLab)
+plot(clusDendro, main=paste("Aitchison distance, Ward.D2 Cluster, p = ", ano$signif, sep=""))
+
+dev.off()
+
+#################################
+# ALDEx2 differential abundance
+png(filename=paste(folder, "condition_coda_aldex.png", sep=""), type="cairo",
+    units="in", width=8, height=4, pointsize=12,
+    res=300)
+
+par(mfrow=c(1,2))
+
+plot(f.e$rab.all, f.e$diff.btw, pch=19, cex=0.3, col="grey", xlab="Abundance", ylab="Difference", main="Bland-Altman")
+points(f.e$rab.all[high.e], f.e$diff.btw[high.e], pch=19, cex=0.5, col="red")
+points(f.e$rab.all[sigBlue], f.e$diff.btw[sigBlue], cex=0.7, col="blue")
+mtext("Declined", 2, line = 2, at = min(f.e$diff.btw), 
+      col = "grey", cex = 0.8)
+mtext("Healthy", 2, line = 2, at = max(f.e$diff.btw), 
+      col = "grey", cex = 0.8)
+
+plot(f.e$diff.win, f.e$diff.btw, pch=19, cex=0.3, col="grey",xlab="Dispersion", ylab="Difference", main="Effect")
+points(f.e$diff.win[high.e], f.e$diff.btw[high.e], pch=19, cex=0.5, col="red")
+points(f.e$diff.win[sigBlue], f.e$diff.btw[sigBlue], cex=0.7, col="blue")
+abline(0,1, lty=2, col="grey")
+abline(0,-1, lty=2, col="grey")
+mtext("Declined", 2, line = 2, at = min(f.e$diff.btw), 
+      col = "grey", cex = 0.8)
+mtext("Healthy", 2, line = 2, at = max(f.e$diff.btw), 
+      col = "grey", cex = 0.8)
+
+dev.off()
+
+#############################
+# Save effect and CI as csv
+
+if (length(high.e) == 0) {
+  
+  effect.frame <- data.frame(Parcela = i,
+                             Taxa = NA, 
+                             diff.btw = NA,
+                             diff.wtn = NA,
+                             Effect = NA,
+                             Effec.cilow = NA,
+                             Effec.cihigh = NA,
+                             CIzero = NA,
+                             we.pval = NA,
+                             wi.pval = NA,
+                             we.sig = NA,
+                             wi.sig = NA,
+                             overlap = NA) 
+  
+} else {
+  
+  effect.frame <- data.frame(Parcela = rep(i, length(sgn[high.e])),
+                             Taxa = as.vector(rownames(f.e)[high.e]),
+                             diff.btw = as.vector(f.e$diff.btw[high.e]),
+                             diff.wtn = as.vector(f.e$diff.win[high.e]),                        
+                             Effect = as.vector(f.e$effect[high.e]),
+                             Effec.cilow = as.vector(f.e$effect.low[high.e]),
+                             Effec.cihigh = as.vector(f.e$effect.high[high.e]),
+                             CIzero = sgn[high.e],
+                             we.pval = as.vector(f.t$we.eBH[high.e]),
+                             wi.pval = as.vector(f.t$wi.eBH[high.e]),
+                             we.sig = as.vector(f.t$we.eBH[high.e]) < 0.05,
+                             wi.sig = as.vector(f.t$wi.eBH[high.e]) < 0.05,
+                             overlap = as.vector(f.e$overlap[high.e])) 
+  
+}
+
+write.csv(effect.frame, paste(folder, "condition_coda_effect.csv", sep=""))
+
+
+```
+
+### Venn's diagram
+
+```{r}
+
+# Helper function to display Venn diagram
+display_venn <- function(x, ...){
+  grid.newpage()
+  venn_object <- venn.diagram(x, filename = NULL, disable.logging = TRUE, ...)
+  grid.draw(venn_object)
+}
+
+# Check in how many samples a given genera is present
+dis.thres <- apply(data24.res[, data24.meta$CONDICION == "Disease"], 1, function(x) length(which(x == 0)))
+hea.thres <- apply(data24.res[, data24.meta$CONDICION == "Healthy"], 1, function(x) length(which(x == 0)))
+
+# Store venn diagrams
+vennList <- list()
+
+for (i in 1:12) {
+  
+  plotdat <- list(Declined = rownames(data24.res)[dis.thres >= i],
+                  Healthy = rownames(data24.res)[hea.thres >= i])
+  
+  # Plot diagram
+  vennList[[i]] <- grid2grob(display_venn(plotdat,
+                                          main = paste("Threshold = ", i, sep=""),
+                                          category.names = c("Declined", "Healthy"),
+                                          cat.default.pos = "outer",
+                                          cat.col = c("orange", 'skyblue'),
+                                          print.mode = c("raw", "percent"),
+                                          col=c("orange", 'skyblue'),
+                                          fill = c(alpha("orange",0.3), alpha('skyblue',0.3))))
+                             
+  
+}
+
+
+
+```
+
+### Arrange in one plot
+
+```{r, fig.width=20, fig.height=7}
+png(filename=paste(folder, "figs/venn_diagram_all_thres.png", sep=""), type="cairo",
+      units="in", width=20, height=7, pointsize=12,
+      res=300)
+
+ggarrange(plotlist = vennList, ncol = 6, nrow = 2)
+
+dev.off()
+```
+
+### Get Venn data genera for threshold 10
+
+```{r}
+venndat <- list(Declined = rownames(data24.res)[dis.thres >= 10],
+                Healthy = rownames(data24.res)[hea.thres >= 10])
+
+commongen <- intersect(venndat$Declined, venndat$Healthy)
+onlydis <- venndat$Declined[!(venndat$Declined %in% venndat$Healthy)]
+onlyhel <- venndat$Healthy[!(venndat$Healthy %in% venndat$Declined)]
+
+wb <- createWorkbook()
+sheet <- createSheet(wb, "common_genera")
+addDataFrame(commongen, sheet=sheet, startColumn=1, row.names=FALSE, showNA = T)
+sheet <- createSheet(wb, "only_Declined")
+addDataFrame(onlydis, sheet=sheet, startColumn=1, row.names=FALSE, showNA = T)
+sheet <- createSheet(wb, "only_healthy")
+addDataFrame(onlyhel, sheet=sheet, startColumn=1, row.names=FALSE, showNA = T)
+
+saveWorkbook(wb, "venn_genera.xlsx")
+```
+
+
+### PCA and Venn in same plot
+
+Use info from venn_diagram_all_thres.png
+
+```{r}
+# Load required for PCA
+loadlist <- readRDS(paste(folder, "condition_coda_data.RDS", sep=""))
+list2env(loadlist, .GlobalEnv)
+
+# Parameters for Venn diagram
+comm <- 237
+onlydis <- 31
+onlyhel <- 43
+
+areadis <- comm+onlydis
+areahel <- comm+onlyhel
+rad.dis <- sqrt(areadis/pi)
+rad.hel <- sqrt(areahel/pi)
+
+# Find x1 and x2 values heuristically until the intersection is close enough to comm value
+# circle_intersection(19.015, 20, rad.hel, 20.985, 20, rad.dis)
+
+```
+
+```{r,fig.width=9,fig.height=5.5}
+
+png(filename=paste(folder, "figs/condition_pca_venn.png", sep=""), type="cairo",
+    units="in", width=9, height=5.5, pointsize=12,
+    res=300)
+
+xlab <- paste("PC1: ", pc1, sep="")
+ylab <- paste("PC2: ", pc2, sep="")
+
+# Set layout for 5 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,3), nrow = 2, ncol = 2, byrow = TRUE), heights = c(5.5, 0.5), widths = c(4.4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2)
+
+####################################
+# Venn
+par(mai = c(1, 0.1, 0.8, 0.6))
+plot(NULL, xlim = c(9,31), ylim = c(9,31), xaxt = "n", yaxt = "n", bty = "n", ylab = NA, xlab = NA)
+draw.circle(19.015, 20, rad.hel, border = "skyblue", lwd = 2, col = alpha("skyblue", 0.4))
+draw.circle(20.985, 20, rad.dis, border = "orange", lwd = 2, col = alpha("orange", 0.4))
+text(20, 20, labels = paste(comm, "\n(", round(comm/(comm+onlydis+onlyhel), 3)*100, "%)", sep=""))
+text(20 + rad.hel, 20, labels = paste(onlydis, "\n(", round(onlydis/(comm+onlydis+onlyhel), 4)*100, "%)", sep=""))
+text(20 - rad.dis, 20, labels = paste(onlyhel, "\n(", round(onlyhel/(comm+onlydis+onlyhel), 4)*100, "%)", sep=""))
+mtext("A", 2, line = -1.5, at = 35, cex = 3, las = 1)
+
+#####################################
+# SVD
+par(mai = c(1, 0.8, 0.8, 0.5), mgp=c(3,0.7,0))
+plot(pcx$rotation[, 1], pcx$rotation[, 2], 
+     ylab=NA, xlab=NA, yaxt = "n", xaxt = "n", 
+     col=rgb(0,0,0,0.1), cex=0.7, pch=19)
+axis(3, at = round(seq(min(pcx$rotation[, 1]), max(pcx$rotation[, 1]), 0.15), 2), 
+     labels = round(seq(min(pcx$rotation[, 1]), max(pcx$rotation[, 1]), 0.15), 2),
+     col.axis = "gray", col = "gray", cex.axis = 0.8)
+axis(4, at = round(seq(min(pcx$rotation[, 2]), max(pcx$rotation[, 2]), 0.1), 2), 
+     labels = round(seq(min(pcx$rotation[, 2]), max(pcx$rotation[, 2]), 0.1), 2),
+     col.axis = "gray", col = "gray", cex.axis = 0.8)
+title(ylab = ylab, xlab = xlab, line=2.5)
+mtext("B", 2, line = 2.5, at = 0.17, cex = 3, las = 1)
+# Aitchison distance between samples
+par(new = TRUE)
+plot(pcx$x[, 1], pcx$x[, 2],
+     xlab = NA, ylab = NA, yaxt = "n", xaxt = "n",
+     col=c(rep(alpha("orange",0.8), 3), rep(alpha("skyblue", 0.8), 3)), cex=1.2, pch = 19,)
+axis(1, at = round(seq(min(pcx$x[, 1]), max(pcx$x[, 1]), 15), 1), 
+     labels = round(seq(min(pcx$x[, 1]), max(pcx$x[, 1]), 15), 1),
+     cex.axis = 0.8)
+axis(2, at = round(seq(min(pcx$x[, 2]), max(pcx$x[, 2]), 12), 1), 
+     labels = round(seq(min(pcx$x[, 2]), max(pcx$x[, 2]), 12), 1),
+     cex.axis = 0.8)
+
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+
+```
